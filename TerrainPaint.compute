@@ -1,0 +1,176 @@
+// --- 文件名: TerrainPaint.compute ---
+#pragma kernel CSMain
+
+struct Segment
+{
+    float4 p0;  // 起点
+    float4 p1;  // 终点
+    float4 min; // 包围盒 Min
+    float4 max; // 包围盒 Max
+};
+
+// --- 输入/输出 ---
+RWTexture2D<float> _ResultHeight;
+Texture2D<float> _SourceHeight;
+Texture2D<float> _BankCurve;
+SamplerState sampler_BankCurve;
+
+StructuredBuffer<Segment> _Segments;
+int _SegmentsCount;
+
+// --- 参数 ---
+float _BrushWidth;
+float _BankWidth;
+float _HeightOffset;
+int _PaintMode; // 0 = Path (Stroke), 1 = Polygon Fill (Flatten)
+
+float3 _TerrainPos;
+float3 _TerrainSize;
+int _Resolution;
+float4 _GlobalBounds; // x,y,z,w = minX, minZ, maxX, maxZ (整个样条线的2D包围盒)
+
+// --- 辅助函数 ---
+
+// 计算点在包含无限长直线的投影比例
+float GetSegmentT(float3 p, float3 a, float3 b)
+{
+    float3 pa = p - a;
+    float3 ba = b - a;
+    // 只在 XZ 平面上计算，忽略 Y 轴高度差对“最近点”判断的影响
+    float2 pa2 = pa.xz;
+    float2 ba2 = ba.xz;
+    float h = clamp(dot(pa2, ba2) / dot(ba2, ba2), 0.0, 1.0);
+    return h;
+}
+
+// 点到线段的距离平方 (2D XZ平面)
+float DistToSegmentSq2D(float3 p, float3 a, float3 b, out float tVal)
+{
+    tVal = GetSegmentT(p, a, b);
+    float3 closest = lerp(a, b, tVal);
+    float2 diff = p.xz - closest.xz;
+    return dot(diff, diff);
+}
+
+// 射线法判断点是否在多边形内
+bool IsPointInPolygon(float2 pt)
+{
+    bool inside = false;
+    for (int i = 0; i < _SegmentsCount; i++)
+    {
+        float2 p0 = _Segments[i].p0.xz;
+        float2 p1 = _Segments[i].p1.xz;
+
+        // 简单的射线相交测试 (Ray Casting)
+        if (((p1.y > pt.y) != (p0.y > pt.y)) &&
+            (pt.x < (p0.x - p1.x) * (pt.y - p1.y) / (p0.y - p1.y) + p1.x))
+        {
+            inside = !inside;
+        }
+    }
+    return inside;
+}
+
+[numthreads(8, 8, 1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_Resolution || id.y >= (uint)_Resolution)
+        return;
+
+    // 1. 计算当前像素的世界坐标 (XZ)
+    float2 uv = float2(id.x, id.y) / (float)(_Resolution - 1);
+    float3 worldPos = _TerrainPos + float3(uv.x * _TerrainSize.x, 0, uv.y * _TerrainSize.z);
+
+    // [优化] 全局包围盒剔除 (只判断 XZ)
+    // 如果点在整个样条线的范围之外，直接跳过 (对填充模式非常重要)
+    // 稍微扩大一点 _GlobalBounds 以容纳笔刷宽度
+    float expand = _BrushWidth + _BankWidth;
+    if (worldPos.x < _GlobalBounds.x - expand || worldPos.x > _GlobalBounds.z + expand ||
+        worldPos.z < _GlobalBounds.y - expand || worldPos.z > _GlobalBounds.w + expand)
+    {
+        return; // 保持原有值 (_ResultHeight 初始应该是 copy _SourceHeight)
+    }
+
+    float originalH = _SourceHeight[id.xy];
+    float finalH = originalH;
+
+    // --- 寻找最近线段 (计算距离场) ---
+    float minDistSq = 10000000.0;
+    float bestT = 0;
+    float3 bestP0 = 0;
+    float3 bestP1 = 0;
+
+    // 暴力遍历寻找最近点 (用于高度插值)
+    for (int i = 0; i < _SegmentsCount; i++)
+    {
+        Segment s = _Segments[i];
+        // 局部包围盒剔除 (XZ only)
+        if (worldPos.x < s.min.x || worldPos.x > s.max.x ||
+            worldPos.z < s.min.z || worldPos.z > s.max.z)
+            continue;
+
+        float t;
+        float dSq = DistToSegmentSq2D(worldPos, s.p0.xyz, s.p1.xyz, t);
+        if (dSq < minDistSq)
+        {
+            minDistSq = dSq;
+            bestT = t;
+            bestP0 = s.p0.xyz;
+            bestP1 = s.p1.xyz;
+        }
+    }
+
+    float dist = sqrt(minDistSq);
+    
+    // 计算基于最近线段的目标高度 (这样可以支持倾斜平面)
+    float splineHeight = lerp(bestP0.y, bestP1.y, bestT);
+    float targetHeight = splineHeight + _HeightOffset;
+    float targetHeight01 = (targetHeight - _TerrainPos.y) / _TerrainSize.y;
+
+    // --- 模式分支 ---
+    
+    // Mode 0: Path (描边模式)
+    if (_PaintMode == 0)
+    {
+        float totalWidth = _BrushWidth + _BankWidth;
+        if (dist < totalWidth)
+        {
+            float alpha = 0;
+            if (dist <= _BrushWidth)
+            {
+                alpha = 1.0;
+            }
+            else
+            {
+                float bankPos = (dist - _BrushWidth) / _BankWidth;
+                float curveVal = _BankCurve.SampleLevel(sampler_BankCurve, float2(bankPos, 0), 0).r;
+                alpha = 1.0 - curveVal;
+            }
+            finalH = lerp(originalH, targetHeight01, alpha);
+        }
+    }
+    // Mode 1: Polygon Fill (闭合填充模式)
+    else 
+    {
+        // 1. 如果在“内部”，直接设为目标高度
+        if (IsPointInPolygon(worldPos.xz))
+        {
+            finalH = targetHeight01;
+        }
+        // 2. 如果在“外部”但距离很近 (Bank 区域)，进行平滑过渡 (可选)
+        else
+        {
+            float totalWidth = _BrushWidth + _BankWidth; // 这里的 BrushWidth 可以理解为边缘羽化距离
+            if (dist < totalWidth)
+            {
+                 // 外部渐变
+                float bankPos = dist / totalWidth; // 简单线性衰减
+                // 或者重用 BankCurve
+                float alpha = 1.0 - smoothstep(0, totalWidth, dist); 
+                finalH = lerp(originalH, targetHeight01, alpha);
+            }
+        }
+    }
+
+    _ResultHeight[id.xy] = finalH;
+}
